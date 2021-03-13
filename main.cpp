@@ -4,51 +4,57 @@
 #include <opencv2/videoio.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/video.hpp>
+#include <opencv2/tracking.hpp>
 using namespace cv;
 using namespace std;
+Ptr<Tracker> tracker;
 
-TermCriteria term_crit(TermCriteria::EPS | TermCriteria::COUNT, 5, 1);
-
-
-int channels[] = {0};
-float range_[] = {0, 180};
-const float* range[] = {range_};
-
-bool checkParam2(bool flag,int param2) {
-	if (flag)
-		return param2 < 45;
-	else return param2 < 60;
-}
-
-bool detectCircle(const Mat& frame, Rect&bbor,int dx,int dy,bool flag = false) {
+bool detectCircle(const Mat& frame, Rect2d&bbor,int dx,int dy,bool flag = false) {
 	vector<Vec3f> circles;
 	Mat gray;
 	cvtColor(frame, gray, COLOR_BGR2GRAY);
 	medianBlur(gray, gray, 5);
-	int param2 = 40;
-	do {
-		cout<<param2<<endl;
-		if (!flag)
-		HoughCircles(gray, circles, HOUGH_GRADIENT, 1,
-		             gray.rows / 16 <= 0 ? 1 : gray.rows / 16,  // change this value to detect circles with different distances to each other
-		             100, param2++, 50, 100 // change the last two parameters
-				// (min_radius & max_radius) to detect larger circles
-		);
-		else HoughCircles(gray, circles, HOUGH_GRADIENT, 1,
-		                  gray.rows / 16 <= 0 ? 1 : gray.rows / 16,  // change this value to detect circles with different distances to each other
-		                  100, param2++, 40, max(frame.rows,frame.cols) // change the last two parameters
+	int param2 = flag?40:54;
+	if (!flag) {
+		int left = 0;
+		int right = 1000;
+		int mid = (left + right )/ 2;
+		while (left < right) {
+			HoughCircles(gray, circles, HOUGH_GRADIENT, 2,
+			             gray.rows / 16 <= 0 ? 1 : gray.rows /
+			                                       16,  // change this value to detect circles with different distances to each other
+			             100, mid, 50, 90// change the last two parameters
 					// (min_radius & max_radius) to detect larger circles
 			);
-		Mat copy;
-		frame.copyTo(copy);
-		for (auto & circle : circles) {
-			Rect2d te = Rect2d(circle[0] - circle[2] + dx,circle[1] - circle[2] + dy,circle[2]*2,circle[2]*2);
-			rectangle(copy,te,255,2);
+			if (circles.size() > 1 )
+				left = mid + 1;
+			else if (circles.empty())
+				right = mid - 1;
+			else {
+				break;
+			}
+			mid = (left + right) / 2;
 		}
-		imshow("DDD",copy);
-		waitKey();
-	} while(circles.size() > 1 && checkParam2(flag,param2));
-	cout<<param2<<endl;
+	} else {
+		int left = 40;
+		int right = 60;
+		int mid = (left + right )/ 2;
+		while (left < right) {
+			HoughCircles(gray, circles, HOUGH_GRADIENT, 2,
+			             gray.rows ,  // change this value to detect circles with different distances to each other
+			             100, mid, min(max(frame.rows,frame.cols)/4 - 5, 0) , min(frame.rows,frame.cols)/4 + 5// change the last two parameters
+					// (min_radius & max_radius) to detect larger circles
+			);
+			if (circles.size() > 1 )
+				left = mid + 1;
+			else if (circles.empty())
+				right = mid - 1;
+			else {
+				break;
+			}
+			mid = (left + right) / 2;
+		}
+	}
 	if (circles.size() == 1) {
 		Vec3i c = circles[0];
 		bbor = Rect2d(c[0] - c[2] + dx,c[1] - c[2] + dy,c[2]*2,c[2]*2);
@@ -58,23 +64,25 @@ bool detectCircle(const Mat& frame, Rect&bbor,int dx,int dy,bool flag = false) {
 	return false;
 }
 
-void initCircle(const Mat& frame,Rect&bbor,Mat&roi) {
-	Mat hsv,mask;
-	cvtColor(frame(bbor), hsv, COLOR_BGR2HSV);
-	inRange(hsv, Scalar(0, 60, 32), Scalar(180, 255, 255), mask);
-	int histSize[] = {180};
-	calcHist(&hsv, 1, channels, mask, roi, 1, histSize, range);
-	normalize(roi, roi, 0, 255, NORM_MINMAX);
+void initCircle(const Mat& frame,Rect2d&bbor) {
+	tracker = TrackerKCF::create();
+	tracker->init(frame,bbor);
 }
 
-void trackCircle(const Mat& frame,Rect&bbor,Mat&roi) {
-	Mat hsv, destination;
-	cvtColor(frame, hsv, COLOR_BGR2HSV);
-	calcBackProject(&hsv, 1, channels, roi, destination, range);
-	meanShift(destination, bbor, term_crit);
-	rectangle(frame,bbor, 255, 2);
+void draw(const Mat& frame,Rect2d&bbor) {
+	rectangle(frame,bbor,255,2);
 }
 
+bool trackCircleWithoutDraw(const Mat& frame,Rect2d&bbor) {
+	return tracker->update(frame,bbor);
+}
+
+bool trackCircle(const Mat& frame,Rect2d&bbor) {
+	bool ret = trackCircleWithoutDraw(frame,bbor);
+	if (ret)
+		draw(frame,bbor);
+	return ret;
+}
 
 bool pause() {
 	int keyboard = waitKey(30);
@@ -86,7 +94,7 @@ bool pause() {
 	return false;
 }
 
-Mat mat2(const Mat& frame,const Rect& bbor) {
+Rect getBborExpand(const Mat& frame,const Rect& bbor) {
 	int b = max(bbor.width ,bbor.height);
 	int leftx = bbor.x - b / 2;
 	int rightx = bbor.x + b * 3 / 2;
@@ -97,73 +105,88 @@ Mat mat2(const Mat& frame,const Rect& bbor) {
 	lefty = lefty < 0 ? 0 : lefty;
 	righty = righty > frame.rows ? frame.rows : righty;
 	int a = min(rightx - leftx,righty - lefty);
-	return Mat(frame,Rect(leftx,lefty,a,a));
+	return {leftx,lefty,a,a};
 }
 
-bool first = true;
 
 int main(int argc, char **argv)
 {
 //	Mat f = imread("../h2.png");
-//	Rect bbor;
-//	detectCircle(f,bbor,0,0);
-//	rectangle(f,bbor,255,2);
+//	Rect2d r;
+//	bool fx = detectCircle(f,r,0,0);
+//	cout<<fx<<endl;
+//	rectangle(f,r,255,2);
 //	imshow("fff",f);
 //	waitKey();
 //	return 0;
+	string trackerTypes[8] = {"BOOSTING", "MIL", "KCF", "TLD","MEDIANFLOW", "GOTURN", "MOSSE", "CSRT"};
+	// vector <string> trackerTypes(types, std::end(types));
+
+	// Create a tracker
+	string trackerType = trackerTypes[2];
+
+	if (trackerType == "BOOSTING")
+		tracker = TrackerBoosting::create();
+	if (trackerType == "MIL")
+		tracker = TrackerMIL::create();
+	if (trackerType == "KCF")
+		tracker = TrackerKCF::create();
+	if (trackerType == "TLD")
+		tracker = TrackerTLD::create();
+	if (trackerType == "MEDIANFLOW")
+		tracker = TrackerMedianFlow::create();
+	if (trackerType == "GOTURN")
+		tracker = TrackerGOTURN::create();
+	if (trackerType == "MOSSE")
+		tracker = TrackerMOSSE::create();
+	if (trackerType == "CSRT")
+		tracker = TrackerCSRT::create();
 	VideoCapture capture("../a.mp4");
-//	VideoCapture capture(0);
 	if (!capture.isOpened()){
 		//error in opening the video input
 		cerr << "Unable to open file!" << endl;
 		return 0;
 	}
-	Rect bbor;
+	Rect2d bbor;
 	bool isDetected = false;
 	Mat frame,roi;
 	capture >> frame;
 	if (detectCircle(frame, bbor,0,0)) {
 		isDetected = true;
-		first = false;
-		initCircle(frame, bbor, roi);
+		initCircle(frame, bbor);
 	}
-	int pos = 0;
 	int lastx = -1,lasty = -1;
-	int64 lasttimer = getTickCount();
 	int pos2 = 0;
 	while(capture.read(frame)){
 		int64 timer = getTickCount();
 		if (bbor.width < 50 && bbor.height < 50)
 			isDetected = false;
+		Rect rect = getBborExpand(frame,bbor);
 		if (isDetected) {
-			if (timer - lasttimer > 3000000) {
-				if (!detectCircle(mat2(frame,bbor),bbor,bbor.x - bbor.width /2,bbor.y - bbor.height /2,true)) {
-					pos2++;
-					if (pos2 == 10) {
-						isDetected = false;
-						pos2 = 0;
-					}
-					trackCircle(frame,bbor,roi);
-				} else {
+			if (!detectCircle(Mat(frame,rect),bbor,rect.x,rect.y,true)) {
+				pos2++;
+				if (pos2 == 10) {
+					isDetected = false;
 					pos2 = 0;
-					cout<<"capture"<<endl;
-//					trackCircle(frame, bbor, roi); // track twice
 				}
-				lasttimer = timer;
-			} else
-			trackCircle(frame, bbor, roi);
+				bool flag = trackCircle(frame, bbor);
+				if (flag) {
+					pos2 = 0;
+					cout<<"tracked"<<endl;
+				}
+			} else {
+				pos2 = 0;
+				cout<<"capture"<<endl; // track twice
+//				trackCircleWithoutDraw(frame,bbor);
+				draw(frame,bbor);
+			}
 		} else {
-			pos++;
-			if (pos > 15) {
-				if (detectCircle(frame, bbor,0,0)) {
-					isDetected = true;
-					if (first) {
-						first = false;
-						initCircle(frame, bbor, roi);
-					}
-					trackCircle(frame,bbor,roi);
-				}
-				pos = 0;
+			if (detectCircle(frame, bbor, 0, 0)) {
+				isDetected = true;
+				lasty = -1;
+				lastx = -1;
+				initCircle(frame, bbor);
+				trackCircle(frame, bbor);
 			}
 		}
 		if (isDetected) {
